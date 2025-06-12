@@ -1,174 +1,320 @@
+# [0] Imports & Setup
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import classification_report, mean_absolute_error, confusion_matrix, accuracy_score, precision_score, recall_score
-import matplotlib.pyplot as plt
+from sklearn.utils.class_weight import compute_sample_weight
+import xgboost as xgb
+import joblib
+import shap
+from datetime import datetime
+from collections import Counter
+import optuna
+from optuna.integration import XGBoostPruningCallback
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, LSTM, Dense
 from tensorflow.keras.callbacks import EarlyStopping
-import xgboost as xgb
-from xgboost import XGBClassifier
-import joblib
-from tensorflow.keras.utils import model_to_dot
-from io import StringIO
+from sklearn.metrics import average_precision_score
+from sklearn.preprocessing import label_binarize
 
-# Load and preprocess data
-df = pd.read_csv("lettuce_wavelet_cleaned.csv")
-original_labels = df['growth_stage'].values
-y_yield = df['yield_count'].values
 
-X_features = df.drop(columns=['yield_count', 'growth_stage', 'timestamp', 'batch_id'], errors='ignore')
 
-scaler = MinMaxScaler()
-scaled_data = scaler.fit_transform(X_features)
+# [1] Load & Preprocess Data
+def load_and_preprocess_data(filepath, seq_len=10):
+    df = pd.read_csv(filepath)
 
-# Sequence creation
+    # Extract targets
+    original_labels = df['growth_stage'].values
+    y_yield = df['yield_count'].values
+
+    # Drop unused columns and scale features
+    features = df.drop(columns=['yield_count', 'growth_stage', 'timestamp', 'batch_id'], errors='ignore')
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(features)
+
+    # Sequence creation
+    def create_sequences(data, length):
+        return np.array([data[i:i + length] for i in range(len(data) - length)])
+
+    def create_targets(target, length):
+        return np.array([target[i + length] for i in range(len(target) - length)])
+
+    X_seq = create_sequences(scaled, seq_len)
+    y_yield_seq = create_targets(y_yield, seq_len)
+    y_stage_seq = create_targets(original_labels, seq_len)
+
+    # Encode labels using fixed order
+    fixed_stage_order = ['Seed Sowing', 'Germination', 'Leaf Development', 'Head Formation', 'Harvesting']
+    label_encoder = LabelEncoder()
+    label_encoder.classes_ = np.array(fixed_stage_order)
+    y_stage_encoded = label_encoder.transform(y_stage_seq)
+
+    return X_seq, y_yield_seq, y_stage_encoded, label_encoder, scaler
+
+# [2] Build LSTM Models
+def build_lstm_feature_model(seq_len, n_features):
+  # Fixed batch size for TFLite Micro: batch=1
+    inp = Input(batch_shape=(1, seq_len, n_features), name="input")
+    x = LSTM(128, return_sequences=False, name="lstm_out")(inp)
+    out = Dense(1, name="yield_output")(x)
+    model = Model(inputs=inp, outputs=out)
+    return model
+
+def build_forecast_model(seq_len, n_features):
+    inp = Input(batch_shape=(1, seq_len, n_features), name="input")
+    x = LSTM(128, return_sequences=False, name="lstm_forecast")(inp)
+    out = Dense(n_features, name="sensor_output")(x)
+    model = Model(inputs=inp, outputs=out)
+    return model
+
+# [3] Confusion Matrix Plot
+def plot_confusion_matrix(y_true, y_pred, labels, fname="conf_matrix.png"):
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.matshow(cm, cmap="Blues")
+    for (i, j), val in np.ndenumerate(cm):
+        ax.text(j, i, str(val), ha="center", va="center", color="black")
+    plt.xticks(ticks=np.arange(len(labels)), labels=labels, rotation=45)
+    plt.yticks(ticks=np.arange(len(labels)), labels=labels)
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.title("Growth Stage Confusion Matrix")
+    plt.tight_layout()
+    plt.savefig(fname)
+    plt.show()
+
+# [4] LSTM Feature Extraction + Train/Test Split
 SEQ_LEN = 10
+X, y_yield, y_stage, le, scaler = load_and_preprocess_data("lettuce_wavelet_cleaned.csv", SEQ_LEN)
+class_names = le.classes_
 
-def create_sequences(data, seq_len):
-    return np.array([data[i:i + seq_len] for i in range(len(data) - seq_len)])
-
-def create_target_sequences(target, seq_len):
-    return np.array([target[i + seq_len] for i in range(len(target) - seq_len)])
-
-X_seq = create_sequences(scaled_data, SEQ_LEN)
-y_yield_seq = create_target_sequences(y_yield, SEQ_LEN)
-y_stage_seq = create_target_sequences(original_labels, SEQ_LEN)
-
-# Encode growth stage
-label_encoder = LabelEncoder()
-y_stage_encoded = label_encoder.fit_transform(y_stage_seq)
-class_names = label_encoder.classes_
-
-# Train/test split
-X_train_seq, X_test_seq, y_yield_train, y_yield_test, y_stage_train, y_stage_test = train_test_split(
-    X_seq, y_yield_seq, y_stage_encoded, test_size=0.1, random_state=42, stratify=y_stage_encoded
+X_train, X_test, y_yield_train, y_yield_test, y_stage_train, y_stage_test = train_test_split(
+    X, y_yield, y_stage, test_size=0.1, stratify=y_stage, random_state=42
 )
-
-# Build LSTM feature extractor with regression output (1 output)
-input_layer = Input(shape=(SEQ_LEN, X_seq.shape[2]))
-x = LSTM(128, return_sequences=False, name='lstm_out')(input_layer)
-output = Dense(1, name='yield_output')(x)
-lstm_model = Model(inputs=input_layer, outputs=output)
-
-lstm_model.compile(optimizer='adam', loss='mse', metrics=['mae'])
-early_stop = EarlyStopping(patience=5, restore_best_weights=True)
-
-# Train LSTM model for yield prediction directly
-lstm_model.fit(X_train_seq, y_yield_train, epochs=30, batch_size=32, callbacks=[early_stop], verbose=1)
-
-# Extract features from the LSTM's last LSTM layer output (before Dense)
-feature_extractor = Model(inputs=lstm_model.input, outputs=lstm_model.get_layer('lstm_out').output)
-
-X_train_lstm = feature_extractor.predict(X_train_seq)
-X_test_lstm = feature_extractor.predict(X_test_seq)
-
-# Print LSTM Model Summary
-print("\n--- LSTM Model Summary ---")
+print("Training Set Growth Stage Distribution:")
+for label_idx, count in sorted(Counter(y_stage_train).items()):
+    print(f"{class_names[label_idx]} ({label_idx}): {count}")
+class_names = list(le.classes_) 
+lstm_model = build_lstm_feature_model(SEQ_LEN, X.shape[2])
+lstm_model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+lstm_model.fit(X_train, y_yield_train, validation_data=(X_test, y_yield_test),
+               epochs=50, batch_size=32, callbacks=[EarlyStopping(patience=5, restore_best_weights=True)])
 lstm_model.summary()
 
-# --- XGBoost: Yield (regression)
-xgb_yield = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, random_state=42)
-xgb_yield.fit(X_train_lstm, y_yield_train)
-y_yield_pred = xgb_yield.predict(X_test_lstm)
+feature_extractor = Model(inputs=lstm_model.input, outputs=lstm_model.get_layer("lstm_out").output)
+X_train_lstm = feature_extractor.predict(X_train)
+X_test_lstm = feature_extractor.predict(X_test)
 
-# --- XGBoost: Growth Stage (classification)
-xgb_stage = xgb.XGBClassifier(objective='multi:softmax', num_class=len(class_names), eval_metric='mlogloss', random_state=42)
-xgb_stage.fit(X_train_lstm, y_stage_train)
-y_stage_pred = xgb_stage.predict(X_test_lstm)
+# [5] XGBoost Regression & Classification
+xgb_reg = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
+xgb_reg.fit(X_train_lstm, y_yield_train)
+y_pred_yield = xgb_reg.predict(X_test_lstm)
 
-# Decode predictions
-y_stage_test_decoded = label_encoder.inverse_transform(y_stage_test)
-y_stage_pred_decoded = label_encoder.inverse_transform(y_stage_pred)
+# Compute class weights: inverse of class frequency
+class_counts = Counter(y_stage_train)
+total = sum(class_counts.values())
+class_weights = {cls: total / (len(class_counts) * count) for cls, count in class_counts.items()}
 
-# --- Evaluation for Yield
-mae = mean_absolute_error(y_yield_test, y_yield_pred)
-print(f"\nYield Prediction MAE: {mae:.4f}")
+# Apply weights to training data
+# y_stage_train is your encoded target (integer labels from LabelEncoder)
+sample_weights = compute_sample_weight(class_weight='balanced', y=y_stage_train)
 
-# --- Evaluation for Growth Stage Classification
-print("\nGrowth Stage Classification Report:")
-print(classification_report(y_stage_test_decoded, y_stage_pred_decoded, target_names=class_names))
+xgb_clf = xgb.XGBClassifier(
+    objective="multi:softmax",
+    num_class=len(class_names),
+    eval_metric="mlogloss"
+)
+xgb_clf.fit(X_train_lstm, y_stage_train, sample_weight=sample_weights)
 
-# Accuracy, Precision, Recall
-accuracy = accuracy_score(y_stage_test, y_stage_pred)
-precision = precision_score(y_stage_test, y_stage_pred, average='weighted', zero_division=0)
-recall = recall_score(y_stage_test, y_stage_pred, average='weighted', zero_division=0)
-print(f"Accuracy: {accuracy:.4f}")
-print(f"Precision: {precision:.4f}")
-print(f"Recall: {recall:.4f}")
+print("\n📊 XGBoost Regressor Parameters:")
+print(xgb_reg.get_params())
+print("Feature Importances (Regressor):", xgb_reg.feature_importances_)
+print("\n📊 XGBoost Classifier Parameters:")
+print(xgb_clf.get_params())
+print("Feature Importances (Classifier):", xgb_clf.feature_importances_)
 
-# Mean Average Precision (mAP) approximation (macro average precision)
-mAP = precision_score(y_stage_test, y_stage_pred, average='macro', zero_division=0)
-print(f"Mean Average Precision (mAP): {mAP:.4f}")
+# [6] Evaluation
+y_pred_stage = xgb_clf.predict(X_test_lstm)
+
+print(f"Yield MAE: {mean_absolute_error(y_yield_test, y_pred_yield):.4f}")
+print("\nGrowth Stage Report:\n", classification_report(
+    y_stage_test,
+    y_pred_stage,
+    target_names=class_names  # safe because y_stage_test and y_pred_stage are integers
+))
+# Binarize the ground truth and predictions for mAP calculation
+y_stage_test_bin = label_binarize(y_stage_test, classes=list(range(len(class_names))))
+y_pred_stage_bin = label_binarize(y_pred_stage, classes=list(range(len(class_names))))
+map_score = average_precision_score(y_stage_test_bin, y_pred_stage_bin, average='macro')
+print(f"\n🎯 Mean Average Precision (mAP): {map_score:.4f}")
+
+plot_confusion_matrix(y_stage_test, y_pred_stage, labels=list(range(len(class_names))), fname="conf_matrix.png")
 
 
-# Print XGBoost Summary
-print("\n--- XGBoost Model Summary ---")
-print(xgb_yield.get_params())
+print("\n--- Stratified K-Fold ---")
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+metrics = []
 
-# Confusion Matrix plot
-conf_mat = confusion_matrix(y_stage_test_decoded, y_stage_pred_decoded, labels=class_names)
-plt.figure(figsize=(10, 6))
-plt.imshow(conf_mat, cmap='Blues')
-plt.colorbar()
-plt.xticks(np.arange(len(class_names)), class_names, rotation=45)
-plt.yticks(np.arange(len(class_names)), class_names)
-plt.title("Growth Stage Confusion Matrix")
+# ✅ Initialize cumulative confusion matrix
+cumulative_cm = np.zeros((len(class_names), len(class_names)), dtype=int)
+
+for i, (train_idx, val_idx) in enumerate(skf.split(X, y_stage), 1):
+    X_train_f, X_val_f = X[train_idx], X[val_idx]
+    y_y_train_f, y_s_train_f = y_yield[train_idx], y_stage[train_idx]
+    y_s_val_f = y_stage[val_idx]
+
+    # 🔁 Train LSTM
+    fold_model = build_lstm_feature_model(SEQ_LEN, X.shape[2])
+    fold_model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    fold_model.fit(X_train_f, y_y_train_f, epochs=50, batch_size=32, verbose=0,
+                   callbacks=[EarlyStopping(patience=5, restore_best_weights=True)])
+
+    # 🔍 Extract features
+    extractor = Model(fold_model.input, fold_model.get_layer("lstm_out").output)
+    X_lstm_f_train = extractor.predict(X_train_f)
+    X_lstm_f_val = extractor.predict(X_val_f)
+
+    # 🌲 Train XGBoost classifier
+    clf = xgb.XGBClassifier(objective="multi:softmax", num_class=len(class_names), eval_metric="mlogloss")
+    sample_weights_fold = compute_sample_weight(class_weight='balanced', y=y_s_train_f)
+    clf.fit(X_lstm_f_train, y_s_train_f, sample_weight=sample_weights_fold)
+    y_pred_fold = clf.predict(X_lstm_f_val)
+
+    # 🧪 Evaluate
+    y_val_bin = label_binarize(y_s_val_f, classes=list(range(len(class_names))))
+    y_pred_bin = label_binarize(y_pred_fold, classes=list(range(len(class_names))))
+
+    metrics.append({
+        "acc": accuracy_score(y_s_val_f, y_pred_fold),
+        "prec": precision_score(y_s_val_f, y_pred_fold, average='weighted', zero_division=0),
+        "rec": recall_score(y_s_val_f, y_pred_fold, average='weighted', zero_division=0),
+        "map": average_precision_score(y_val_bin, y_pred_bin, average='macro')
+    })
+
+    # 📊 Accumulate confusion matrix
+    cm = confusion_matrix(y_s_val_f, y_pred_fold, labels=list(range(len(class_names))))
+    cumulative_cm += cm
+
+# 🖨️ Print per-fold metrics
+for i, m in enumerate(metrics, 1):
+    print(f"Fold {i}: Acc={m['acc']:.4f}, Prec={m['prec']:.4f}, Rec={m['rec']:.4f}, mAP={m['map']:.4f}")
+
+# 📈 Average confusion matrix
+avg_cm = cumulative_cm / skf.get_n_splits()
+
+# 📊 Plot average confusion matrix
+fig, ax = plt.subplots(figsize=(8, 6))
+cax = ax.matshow(avg_cm, cmap="Blues")
+fig.colorbar(cax)
+
+for (i, j), val in np.ndenumerate(avg_cm):
+    ax.text(j, i, f"{val:.1f}", ha="center", va="center", color="black")
+
+plt.xticks(ticks=np.arange(len(class_names)), labels=class_names, rotation=45)
+plt.yticks(ticks=np.arange(len(class_names)), labels=class_names)
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Average Confusion Matrix (5-Fold)")
 plt.tight_layout()
-plt.savefig("results_lstm_xgboost.png")
+plt.savefig("avg_conf_matrix_kfold.png")
 plt.show()
 
-# --- Cross Fold Validation for Growth Stage Classification ---
-print("\n--- Stratified K-Fold Cross Validation on Growth Stage Classifier ---")
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-fold = 1
-accuracies, precisions, recalls, mAPs = [], [], [], []
+# 📌 Optional: print average metrics across all folds
+avg_metrics = {
+    key: np.mean([m[key] for m in metrics])
+    for key in ["acc", "prec", "rec", "map"]
+}
+print(f"\nAvg: Acc={avg_metrics['acc']:.4f}, Prec={avg_metrics['prec']:.4f}, Rec={avg_metrics['rec']:.4f}, mAP={avg_metrics['map']:.4f}")
 
-for train_index, val_index in skf.split(X_seq, y_stage_encoded):
-    X_train_f, X_val_f = X_seq[train_index], X_seq[val_index]
-    y_stage_train_f, y_stage_val_f = y_stage_encoded[train_index], y_stage_encoded[val_index]
-    y_yield_train_f = y_yield_seq[train_index]
-    
-    # Train LSTM feature extractor (reuse same architecture)
-    lstm_model_fold = Model(inputs=input_layer, outputs=output)
-    lstm_model_fold.compile(optimizer='adam', loss='mse', metrics=['mae'])
-    lstm_model_fold.fit(X_train_f, y_yield_train_f, epochs=30, batch_size=32, verbose=0)
-    
-    feature_extractor_fold = Model(inputs=lstm_model_fold.input, outputs=lstm_model_fold.get_layer('lstm_out').output)
-    
-    X_train_lstm_f = feature_extractor_fold.predict(X_train_f)
-    X_val_lstm_f = feature_extractor_fold.predict(X_val_f)
-    
-    # Train XGB classifier
-    xgb_stage_fold = xgb.XGBClassifier(objective='multi:softmax', num_class=len(class_names), eval_metric='mlogloss', use_label_encoder=False, random_state=42)
-    xgb_stage_fold.fit(X_train_lstm_f, y_stage_train_f)
-    
-    y_val_pred = xgb_stage_fold.predict(X_val_lstm_f)
-    
-    acc_f = accuracy_score(y_stage_val_f, y_val_pred)
-    prec_f = precision_score(y_stage_val_f, y_val_pred, average='weighted', zero_division=0)
-    rec_f = recall_score(y_stage_val_f, y_val_pred, average='weighted', zero_division=0)
-    map_f = precision_score(y_stage_val_f, y_val_pred, average='macro', zero_division=0)
+import os
+import pickle
 
-    
-    accuracies.append(acc_f)
-    precisions.append(prec_f)
-    recalls.append(rec_f)
-    mAPs.append(map_f)
-    
-    print(f"Fold {fold} - Accuracy: {acc_f:.4f}, Precision: {prec_f:.4f}, Recall: {rec_f:.4f}, mAP: {map_f:.4f}")
-    fold += 1
+# Create directory for model files
+os.makedirs("saved_models", exist_ok=True)
 
-print(f"\nAverage Accuracy: {np.mean(accuracies):.4f}")
-print(f"Average Precision: {np.mean(precisions):.4f}")
-print(f"Average Recall: {np.mean(recalls):.4f}")
-print(f"Average mAP: {np.mean(mAPs):.4f}")
+# Save LSTM model
+lstm_model.save("saved_models/lstm_feature_extractor.keras")
 
-# Save models and encoders
-lstm_model.save("lstm_feature_extractor.keras")
-joblib.dump(scaler, "scaler.save")
-joblib.dump(label_encoder, "label_encoder.save")
-joblib.dump(xgb_yield, "xgb_yield_model.pkl")
-joblib.dump(xgb_stage, "xgb_stage_model.pkl")
-print("\n✅ Models and artifacts saved successfully.")
+# Save XGBoost models using native save_model (more reliable than pickle/joblib)
+xgb_reg.save_model("saved_models/xgb_reg.json")
+xgb_clf.save_model("saved_models/xgb_clf.json")
+
+# Save label encoder and scaler with pickle
+with open("saved_models/label_encoder.pkl", "wb") as f:
+    pickle.dump(le, f)
+
+with open("saved_models/scaler.pkl", "wb") as f:
+    pickle.dump(scaler, f)
+
+print("✅ All models saved safely in 'saved_models/' directory.")
+
+# [9] Forecasting Sensor Data
+def prepare_forecast_data(df, seq_len=10):
+    df_sensors = df.drop(columns=['yield_count', 'growth_stage', 'timestamp', 'batch_id'], errors='ignore')
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(df_sensors)
+
+    X, y = [], []
+    for i in range(len(scaled) - seq_len):
+        X.append(scaled[i:i+seq_len])
+        y.append(scaled[i+seq_len])
+    return np.array(X), np.array(y), scaler
+
+df_raw = pd.read_csv("lettuce_wavelet_cleaned.csv")
+X_fcast, y_fcast, fcast_scaler = prepare_forecast_data(df_raw, SEQ_LEN)
+
+X_f_train, X_f_test, y_f_train, y_f_test = train_test_split(X_fcast, y_fcast, test_size=0.1, random_state=42)
+forecast_model = build_forecast_model(SEQ_LEN, X_fcast.shape[2])
+forecast_model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+forecast_model.fit(X_f_train, y_f_train, validation_data=(X_f_test, y_f_test), epochs=30,
+                   batch_size=32, callbacks=[EarlyStopping(patience=5, restore_best_weights=True)])
+mae_fcast = forecast_model.evaluate(X_f_test, y_f_test)[1]
+forecast_model.summary()
+forecast_model.save("sensor_forecast_model.keras")
+joblib.dump(fcast_scaler, "sensor_forecast_scaler.save")
+print(f"\n📈 Sensor Forecast MAE: {mae_fcast:.4f}")
+
+# [10] Optuna Hyperparameter Tuning
+def objective(trial):
+    params = {
+        "objective": "multi:softmax",
+        "num_class": len(class_names),
+        "eval_metric": "mlogloss",
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+        "max_depth": trial.suggest_int("max_depth", 3, 10),
+        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        "gamma": trial.suggest_float("gamma", 0, 5),
+        "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+        "verbosity": 0,
+        "random_state": 42
+    }
+
+    model = xgb.XGBClassifier(**params)
+    model.fit(
+    X_train_lstm,
+    y_stage_train,
+    sample_weight=sample_weights,
+    eval_set=[(X_test_lstm, y_stage_test)],
+    verbose=False
+)
+
+    preds = model.predict(X_test_lstm)
+    return accuracy_score(y_stage_test, preds)
+
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=30)
+
+print(f"\n🎯 Best Accuracy: {study.best_value:.4f}")
+print("Best Parameters:", study.best_params)
+
+# [11] Retrain with Best Params + SHAP
+best_model = xgb.XGBClassifier(**study.best_params)
+best_model.fit(X_train_lstm, y_stage_train)
+joblib.dump(best_model, "xgb_stage_optuna.pkl")
+
+explainer = shap.Explainer(best_model)
+shap_values = explainer(X_test_lstm[:100])
+shap.summary_plot(shap_values, X_test_lstm[:100], feature_names=[f"LSTM_{i}" for i in range(X_test_lstm.shape[1])])
