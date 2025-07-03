@@ -22,7 +22,8 @@ cursor.execute('''
         light REAL,
         ppfd REAL,
         reflect_445 INTEGER,
-        reflect_480 INTEGER
+        reflect_480 INTEGER,
+        ph REAL      
     )
 ''')
 conn.commit()

@@ -83,6 +83,9 @@ for ts in timestamps:
     else:
         tds = noisy(base_tds, 6)
 
+    # EC (mS/cm) based on TDS
+    ec = round(tds / 640, 2)  # Common hydroponic conversion (1 EC ≈ 640 ppm TDS)
+
     # Light and PPFD
     if 5 <= hour < 6 or 18 <= hour or hour < 5:
         lux = noisy(random.uniform(500, 1000), 30)
@@ -97,12 +100,25 @@ for ts in timestamps:
         lux = noisy(random.uniform(5000, 8000), 200)
         ppfd = noisy(random.uniform(200, 400), 15)
 
-    # Reflectance (sensor facing leaf ideally)
-    reflect_445 = noisy(random.uniform(0.1, 0.9), 0.02)
-    reflect_480 = noisy(random.uniform(0.1, 0.9), 0.02)
+    # Reflectance values based on growth stage
+    reflectance_ranges = {
+        "Seed Sowing": (0.20, 0.40, 0.15, 0.35),
+        "Germination": (0.15, 0.30, 0.12, 0.28),
+        "Leaf Development": (0.08, 0.20, 0.07, 0.18),
+        "Head Formation": (0.05, 0.15, 0.04, 0.12),
+        "Harvesting": (0.10, 0.25, 0.08, 0.20),
+    }
+    r445_min, r445_max, r480_min, r480_max = reflectance_ranges[stage]
+    reflect_445 = noisy(random.uniform(r445_min, r445_max), 0.01)
+    reflect_480 = noisy(random.uniform(r480_min, r480_max), 0.01)
 
-    # pH
-    ph = noisy(random.uniform(5.5, 7.0), 0.1, outlier_prob=0.01, outlier_range=(-1, 1))
+    # pH (base) with gradual rise if unattended (simulate overtime drift)
+    if day < 30:
+        ph = noisy(random.uniform(5.8, 6.2), 0.05, outlier_prob=0.005, outlier_range=(0.2, 0.5))
+    elif 15 <= day < 40:
+        ph = noisy(random.uniform(6.2, 6.5), 0.05, outlier_prob=0.005, outlier_range=(0.2, 0.4))
+    else:
+        ph = noisy(random.uniform(6.5, 6.8), 0.05, outlier_prob=0.01, outlier_range=(0.2, 0.6))
 
     # Yield Count (plant growth tracking)
     if stage == "Harvesting":
@@ -123,16 +139,20 @@ for ts in timestamps:
 
     # Append record
     data.append([
-        batch_id, ts, day, humidity, temp_envi, temp_water, tds, lux, ppfd,
+        batch_id, ts, day, humidity, temp_envi, temp_water, tds, ec, lux, ppfd,
         reflect_445, reflect_480, ph, stage, yield_prediction
     ])
 
-# --- 6. Save to CSV ---
+# --- 6. Create DataFrame (no file saving in this notebook) ---
 df = pd.DataFrame(data, columns=[
-    "batch_id", "timestamp", "day_number", "humidity", "temp_envi", "temp_water", "tds",
+    "batch_id", "timestamp", "day_number", "humidity", "temp_envi", "temp_water", "tds", "ec",
     "lux", "ppfd", "reflect_445", "reflect_480", "ph", "growth_stage", "yield_count"
 ])
 
-file_path = "C:/Users/sayav/OneDrive/Documents/PlatformIO/Projects/LettuceLSTM_RTOS/lettuce_growth_final_with_yieldsu.csv"
+
+# Save the generated DataFrame to CSV
+file_path = "lettuce_growth_with_reflectance_ec_ph.csv"
 df.to_csv(file_path, index=False)
-print("✅ Dataset saved to:", file_path)
+
+file_path  # Provide path for download
+
