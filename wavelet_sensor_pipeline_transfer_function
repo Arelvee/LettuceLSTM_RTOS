@@ -1,0 +1,22 @@
+// Wavelet-Based Sensor ML Pipeline (Transfer Function View)
+digraph {
+	bgcolor=white rankdir=LR
+	node [color=black fontname=Helvetica fontsize=10 shape=record style=filled]
+	N1 [label="{📡 SENSOR_INPUT | Raw time-series from sensors\n$S(t)$}" fillcolor=lightyellow]
+	N2 [label="{🧹 PREPROCESSING | Align + clean data\n$S_{clean}(t) = f_{align}(S(t))$}" fillcolor=lightgray]
+	N3 [label="{🌊 WAVELET_TRANSFORM | DWT: $CA$, $CD$\n$W(t) = DWT(S_{clean})$}" fillcolor=lightblue]
+	N4 [label="{🎯 THRESHOLDING | Denoise\n$CD' = \eta(CD)$}" fillcolor=lightgreen]
+	N5 [label="{🔄 RECONSTRUCTION | Inverse DWT\n$\hat{S}(t) = IDWT(CA, CD')$}" fillcolor=lightcoral]
+	N6 [label="{🧠 FEATURE EXTRACTION | Stats, entropy\n$x = f(\hat{S}(t))$}" fillcolor=lightskyblue]
+	N7 [label="{📊 NORMALIZATION | MinMax / Z-Score\n$x_{norm} = \frac{x - min}{max - min}$}" fillcolor=lightseagreen]
+	N8 [label="{🤖 ML MODEL | LSTM + XGBoost\n$y = M(x_{norm})$}" fillcolor=khaki]
+	N9 [label="{📈 FORECAST OUTPUT | Yield + Growth\n$\hat{y}_{t+n}$}" fillcolor=lightpink]
+	N1 -> N2
+	N2 -> N3
+	N3 -> N4
+	N4 -> N5
+	N5 -> N6
+	N6 -> N7
+	N7 -> N8
+	N8 -> N9
+}
