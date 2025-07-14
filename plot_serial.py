@@ -19,6 +19,7 @@ cursor.execute('''
         temp_envi REAL,
         temp_water REAL,
         tds REAL,
+        dc REAL,
         lux REAL,
         ppfd REAL,
         reflect_445 REAL,

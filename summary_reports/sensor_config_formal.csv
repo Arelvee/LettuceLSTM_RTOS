@@ -1,0 +1,11 @@
+Sensor,Wavelet,Levels,Threshold Mode
+humidity,db8,5,soft
+temp_envi,db4,3,hard
+temp_water,db4,3,hard
+tds,db4,4,soft
+ec,db4,4,soft
+lux,db4,4,soft
+ppfd,db4,4,soft
+reflect_445,sym8,6,garrote
+reflect_480,sym8,6,garrote
+ph,db4,4,soft
